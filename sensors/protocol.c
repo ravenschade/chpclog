@@ -1,5 +1,5 @@
 /*
- * ws protocol handler plugin for "lws-minimal-client-echo"
+ * ws protocol handler plugin for "lws-minimal-pmd-bulk"
  *
  * Copyright (C) 2010-2018 Andy Green <andy@warmcat.com>
  *
@@ -18,72 +18,60 @@
 
 #include <string.h>
 
-#define RING_DEPTH 1024
+/*
+ * We will produce a large ws message either from this text repeated many times,
+ * or from 0x40 + a 6-bit pseudorandom number
+ */
 
-int tstarted=0;
 
-/* one of these created for each message */
+/* this is how much we will send each time the connection is writable */
+#define MESSAGE_CHUNK_SIZE (4 * 1024)
+#define MESSAGE_SIZE (1000000 * 1024)
 
-struct msg {
-  void *payload; /* is malloc'd */
-  size_t len;
-  char binary;
-  char first;
-  char final;
+/* one of these is created for each client connecting to us */
+
+struct per_session_data__minimal_pmd_bulk {
+  int position_tx, position_rx;
+  uint64_t rng_rx, rng_tx;
 };
 
-struct per_session_data__minimal_client_echo {
-  struct lws_ring *ring;
-  uint32_t tail;
-  uint8_t completed:1;
-};
-
-struct vhd_minimal_client_echo {
+struct vhd_minimal_pmd_bulk {
   struct lws_context *context;
   struct lws_vhost *vhost;
   struct lws *client_wsi;
 
   int *interrupted;
   int *options;
-  const char **url;
-  const char **ads;
-  int *port;
 };
 
+static uint64_t rng(uint64_t *r)
+{
+        *r ^= *r << 21;
+        *r ^= *r >> 35;
+        *r ^= *r << 4;
+
+        return *r;
+}
+
 static int
-connect_client(struct vhd_minimal_client_echo *vhd)
+connect_client(struct vhd_minimal_pmd_bulk *vhd)
 {
   struct lws_client_connect_info i;
-  char host[128];
-
-  lws_snprintf(host, sizeof(host), "%s:%u", *vhd->ads, *vhd->port);
 
   memset(&i, 0, sizeof(i));
 
   i.context = vhd->context;
-  i.port = *vhd->port;
-  i.address = *vhd->ads;
-  i.path = *vhd->url;
-  i.host = host;
-  i.origin = host;
+  i.port = 7681;
+  i.address = "localhost";
+  i.path = "/";
+  i.host = i.address;
+  i.origin = i.address;
   i.ssl_connection = LCCSCF_USE_SSL;
   i.vhost = vhd->vhost;
-  //i.protocol = ;
+  i.protocol = "lws-minimal-pmd-bulk";
   i.pwsi = &vhd->client_wsi;
 
-  lwsl_user("connecting to %s:%d/%s\n", i.address, i.port, i.path);
-
   return !lws_client_connect_via_info(&i);
-}
-
-static void
-__minimal_destroy_message(void *_msg)
-{
-  struct msg *msg = _msg;
-
-  free(msg->payload);
-  msg->payload = NULL;
-  msg->len = 0;
 }
 
 static void
@@ -94,16 +82,15 @@ schedule_callback(struct lws *wsi, int reason, int secs)
 }
 
 static int
-callback_minimal_client_echo(struct lws *wsi, enum lws_callback_reasons reason,
+callback_minimal_pmd_bulk(struct lws *wsi, enum lws_callback_reasons reason,
         void *user, void *in, size_t len)
 {
-  struct per_session_data__minimal_client_echo *pss =
-      (struct per_session_data__minimal_client_echo *)user;
-  struct vhd_minimal_client_echo *vhd = (struct vhd_minimal_client_echo *)
+  struct per_session_data__minimal_pmd_bulk *pss =
+      (struct per_session_data__minimal_pmd_bulk *)user;
+  struct vhd_minimal_pmd_bulk *vhd = (struct vhd_minimal_pmd_bulk *)
       lws_protocol_vh_priv_get(lws_get_vhost(wsi),
         lws_get_protocol(wsi));
-  const struct msg *pmsg;
-  struct msg amsg;
+  uint8_t buf[LWS_PRE + MESSAGE_CHUNK_SIZE], *start = &buf[LWS_PRE], *p;
   int n, m, flags;
 
   switch (reason) {
@@ -111,7 +98,7 @@ callback_minimal_client_echo(struct lws *wsi, enum lws_callback_reasons reason,
   case LWS_CALLBACK_PROTOCOL_INIT:
     vhd = lws_protocol_vh_priv_zalloc(lws_get_vhost(wsi),
         lws_get_protocol(wsi),
-        sizeof(struct vhd_minimal_client_echo));
+        sizeof(struct vhd_minimal_pmd_bulk));
     if (!vhd)
       return -1;
 
@@ -122,150 +109,86 @@ callback_minimal_client_echo(struct lws *wsi, enum lws_callback_reasons reason,
     vhd->interrupted = (int *)lws_pvo_search(
       (const struct lws_protocol_vhost_options *)in,
       "interrupted")->value;
-    vhd->port = (int *)lws_pvo_search(
-      (const struct lws_protocol_vhost_options *)in,
-      "port")->value;
     vhd->options = (int *)lws_pvo_search(
       (const struct lws_protocol_vhost_options *)in,
       "options")->value;
-    vhd->ads = (const char **)lws_pvo_search(
-      (const struct lws_protocol_vhost_options *)in,
-      "ads")->value;
-    vhd->url = (const char **)lws_pvo_search(
-      (const struct lws_protocol_vhost_options *)in,
-      "url")->value;
 
     if (connect_client(vhd))
       schedule_callback(wsi, LWS_CALLBACK_USER, 1);
     break;
 
   case LWS_CALLBACK_CLIENT_ESTABLISHED:
-    lwsl_user("LWS_CALLBACK_CLIENT_ESTABLISHED\n");
-    pss->ring = lws_ring_create(sizeof(struct msg), RING_DEPTH,
-              __minimal_destroy_message);
-    if (!pss->ring)
-      return 1;
-    pss->tail = 0;
+    pss->rng_tx = 4;
+    pss->rng_rx = 4;
     lws_callback_on_writable(wsi);
-
-
-
     break;
 
   case LWS_CALLBACK_CLIENT_WRITEABLE:
-    lwsl_user("LWS_CALLBACK_CLIENT_WRITEABLE\n");
-    if(tstarted==0){
-      int len=128;
-      uint8_t ping[LWS_PRE + len];
-      int m;
 
-      n = 0;
+    /*
+     * when we connect, we will send the server a message
+     */
 
-      //n = lws_snprintf((char *)ping + LWS_PRE, len,
-      //               "is ping body!");
-      for(int i=0;i<len;i++)
-      {
-        ping[i+LWS_PRE]=(uint8_t)(rand()%255);
-//        char a=rand();
-//        lws_snprintf((char *)ping + LWS_PRE+i, 2,"a");
-      }
-      ping[len-3+LWS_PRE]=2;
-      ping[len-2+LWS_PRE]=1;
-      ping[len-1+LWS_PRE]=0;
-      n=len;
+    if (pss->position_tx == MESSAGE_SIZE)
+      break;
 
-      lwsl_user("Sending PING %d...\n", n);
+    /* fill up one chunk's worth of message content */
 
-      m = lws_write(wsi, ping + LWS_PRE, n, LWS_WRITE_BINARY);
-      if (m < n) {
-             lwsl_err("sending ping failed: %d\n", m);
+    p = start;
+    n = MESSAGE_CHUNK_SIZE;
+    if (n > MESSAGE_SIZE - pss->position_tx)
+      n = MESSAGE_SIZE - pss->position_tx;
 
-             return -1;
-     }
-     lwsl_user("Sending PING %d done\n", n);
-     tstarted=1;
-//     return -1;
-    }else{
+    flags = lws_write_ws_flags(LWS_WRITE_BINARY, !pss->position_tx,
+             pss->position_tx + n == MESSAGE_SIZE);
+
+    /*
+     * select between producing compressible repeated text,
+     * or uncompressible PRNG output
+     */
+
+      pss->position_tx += n;
+      while (n--)
+        *p++ = rng(&pss->rng_tx);
+
+    n = lws_ptr_diff(p, start);
+    m = lws_write(wsi, start, n, flags);
+    if (m < n) {
+      lwsl_err("ERROR %d writing ws\n", m);
       return -1;
     }
-    break;
-
-    do {
-      pmsg = lws_ring_get_element(pss->ring, &pss->tail);
-      if (!pmsg) {
-        lwsl_user(" (nothing in ring)\n");
-        break;
-      }
-
-      flags = lws_write_ws_flags(
-            pmsg->binary ? LWS_WRITE_BINARY : LWS_WRITE_TEXT,
-            pmsg->first, pmsg->final);
-
-      /* notice we allowed for LWS_PRE in the payload already */
-      m = lws_write(wsi, pmsg->payload + LWS_PRE, pmsg->len, flags);
-      if (m < (int)pmsg->len) {
-        lwsl_err("ERROR %d writing to ws socket\n", m);
-        return -1;
-      }
-
-      lwsl_user(" wrote %d: flags: 0x%x first: %d final %d\n",
-          m, flags, pmsg->first, pmsg->final);
-
-      lws_ring_consume_single_tail(pss->ring, &pss->tail, 1);
-
-    } while (lws_ring_get_element(pss->ring, &pss->tail) &&
-       !lws_send_pipe_choked(wsi));
-
-    /* more to do for us? */
-    if (lws_ring_get_element(pss->ring, &pss->tail))
-      /* come back as soon as we can write more */
+    if (pss->position_tx != MESSAGE_SIZE) /* if more to do... */
       lws_callback_on_writable(wsi);
-
-    if ((int)lws_ring_get_count_free_elements(pss->ring) > RING_DEPTH - 5)
-      lws_rx_flow_control(wsi, 1);
-
-    if ((*vhd->options & 1) && pmsg && pmsg->final)
-      pss->completed = 1;
-
+    else
+      /* if we sent and received everything */
+      if (pss->position_rx == MESSAGE_SIZE)
+        *vhd->interrupted = 2;
     break;
 
   case LWS_CALLBACK_CLIENT_RECEIVE:
 
-    lwsl_user("LWS_CALLBACK_CLIENT_RECEIVE: %4d (rpp %5d, first %d, last %d, bin %d)\n",
+    /*
+     * When we connect, the server will send us a message too
+     */
+
+    lwsl_user("LWS_CALLBACK_CLIENT_RECEIVE: %4d (rpp %5d, last %d)\n",
       (int)len, (int)lws_remaining_packet_payload(wsi),
-      lws_is_first_fragment(wsi),
-      lws_is_final_fragment(wsi),
-      lws_frame_is_binary(wsi));
+      lws_is_final_fragment(wsi));
 
-    // lwsl_hexdump_notice(in, len);
+    p = (uint8_t *)in;
+    pss->position_rx += len;
+    while (len--)
+      if (*p++ != (uint8_t)rng(&pss->rng_rx)) {
+        lwsl_user("echo'd data doesn't match\n");
+        return -1;
+      }
 
-    amsg.first = lws_is_first_fragment(wsi);
-    amsg.final = lws_is_final_fragment(wsi);
-    amsg.binary = lws_frame_is_binary(wsi);
-    n = (int)lws_ring_get_count_free_elements(pss->ring);
-    if (!n) {
-      lwsl_user("dropping!\n");
-      break;
-    }
+    /* if we sent and received everything */
 
-    amsg.len = len;
-    /* notice we over-allocate by LWS_PRE */
-    amsg.payload = malloc(LWS_PRE + len);
-    if (!amsg.payload) {
-      lwsl_user("OOM: dropping\n");
-      break;
-    }
+    if (pss->position_rx == MESSAGE_SIZE &&
+        pss->position_tx == MESSAGE_SIZE)
+      *vhd->interrupted = 2;
 
-    memcpy((char *)amsg.payload + LWS_PRE, in, len);
-    if (!lws_ring_insert(pss->ring, &amsg, 1)) {
-      __minimal_destroy_message(&amsg);
-      lwsl_user("dropping!\n");
-      break;
-    }
-    lws_callback_on_writable(wsi);
-
-    if (n < 3)
-      lws_rx_flow_control(wsi, 0);
     break;
 
   case LWS_CALLBACK_CLIENT_CONNECTION_ERROR:
@@ -273,23 +196,11 @@ callback_minimal_client_echo(struct lws *wsi, enum lws_callback_reasons reason,
        in ? (char *)in : "(null)");
     vhd->client_wsi = NULL;
     schedule_callback(wsi, LWS_CALLBACK_USER, 1);
-    if (*vhd->options & 1) {
-      if (!*vhd->interrupted)
-        *vhd->interrupted = 1;
-      lws_cancel_service(lws_get_context(wsi));
-    }
     break;
 
   case LWS_CALLBACK_CLIENT_CLOSED:
-    lwsl_user("LWS_CALLBACK_CLIENT_CLOSED\n");
-    lws_ring_destroy(pss->ring);
     vhd->client_wsi = NULL;
-    // schedule_callback(wsi, LWS_CALLBACK_USER, 1);
-    //if (*vhd->options & 1) {
-      if (!*vhd->interrupted)
-        *vhd->interrupted = 1 + pss->completed;
-      lws_cancel_service(lws_get_context(wsi));
-  //  }
+    schedule_callback(wsi, LWS_CALLBACK_USER, 1);
     break;
 
   /* rate-limited client connect retries */
@@ -307,12 +218,12 @@ callback_minimal_client_echo(struct lws *wsi, enum lws_callback_reasons reason,
   return 0;
 }
 
-#define LWS_PLUGIN_PROTOCOL_MINIMAL_CLIENT_ECHO \
+#define LWS_PLUGIN_PROTOCOL_MINIMAL_PMD_BULK \
   { \
-    "lws-minimal-client-echo", \
-    callback_minimal_client_echo, \
-    sizeof(struct per_session_data__minimal_client_echo), \
-    1024, \
+    "lws-minimal-pmd-bulk", \
+    callback_minimal_pmd_bulk, \
+    sizeof(struct per_session_data__minimal_pmd_bulk), \
+    4096, \
     0, NULL, 0 \
   }
 
@@ -321,11 +232,11 @@ callback_minimal_client_echo(struct lws *wsi, enum lws_callback_reasons reason,
 /* boilerplate needed if we are built as a dynamic plugin */
 
 static const struct lws_protocols protocols[] = {
-  LWS_PLUGIN_PROTOCOL_MINIMAL_client_echo
+  LWS_PLUGIN_PROTOCOL_MINIMAL_PMD_BULK
 };
 
 LWS_EXTERN LWS_VISIBLE int
-init_protocol_minimal_client_echo(struct lws_context *context,
+init_protocol_minimal_pmd_bulk(struct lws_context *context,
              struct lws_plugin_capability *c)
 {
   if (c->api_magic != LWS_PLUGIN_API_MAGIC) {
@@ -343,7 +254,7 @@ init_protocol_minimal_client_echo(struct lws_context *context,
 }
 
 LWS_EXTERN LWS_VISIBLE int
-destroy_protocol_minimal_client_echo(struct lws_context *context)
+destroy_protocol_minimal_pmd_bulk(struct lws_context *context)
 {
   return 0;
 }
