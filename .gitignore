@@ -1,0 +1,6 @@
+*.x
+*.o
+core
+tags
+*.swp
+libwebsockets
